@@ -2,238 +2,351 @@ import { McpServer } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 
-// Определение структуры задачи
+// ---------- Model ----------
+
 interface TodoItem {
   id: string;
   text: string;
   completed: boolean;
+  deleted: boolean;
 }
 
-// Хранилище задач в памяти
 let todoList: TodoItem[] = [
-  { id: "1", text: "Изучить спецификацию Model Context Protocol", completed: false },
-  { id: "2", text: "Написать MCP-сервер для To-Do списка", completed: false },
+  { id: "1", text: "Study the Model Context Protocol specification", completed: false, deleted: false },
+  { id: "2", text: "Build an MCP server for the to-do list", completed: false, deleted: false },
+  { id: "3", text: "A new test task", completed: false, deleted: false },
 ];
 
-// Инициализация MCP-сервера
+// ---------- Server ----------
+
 const server = new McpServer({
   name: "todo-manager",
   version: "1.0.0",
 });
 
-// Вспомогательная функция для форматирования списка задач для LLM
-const formatTodoList = (todos: TodoItem[]): string => {
-  if (todos.length === 0) return "Список задач пуст.";
-  return todos
-    .map((t, idx) => `[${t.completed ? "X" : " "}] ID: ${t.id} (Позиция: ${idx + 1}) - ${t.text}`)
+// ---------- Filtering and formatting ----------
+
+type FilterStatus = "all" | "active" | "completed" | "deleted";
+
+const filterTodos = (todos: TodoItem[], status: FilterStatus): TodoItem[] => {
+  switch (status) {
+    case "active":    return todos.filter(t => !t.deleted && !t.completed);
+    case "completed": return todos.filter(t => !t.deleted &&  t.completed);
+    case "deleted":   return todos.filter(t =>  t.deleted);
+    case "all":
+    default:          return todos.filter(t => !t.deleted);
+  }
+};
+
+// Status marker inside a line: [ ] active, [X] completed, [D] deleted
+const statusMarker = (t: TodoItem): string =>
+  t.deleted ? "D" : t.completed ? "X" : " ";
+
+const formatTodoList = (todos: TodoItem[], status: FilterStatus = "all"): string => {
+  const filtered = filterTodos(todos, status);
+  if (filtered.length === 0) return "The list is empty.";
+  return filtered
+    .map((t, idx) =>
+      `[${statusMarker(t)}] ID: ${t.id} (Position: ${idx + 1}) - ${t.text}`,
+    )
     .join("\n");
 };
 
-// ==========================================
-// 1. РЕСУРСЫ (Чтение состояния списка)
-// ==========================================
+// ---------- Resources ----------
 
-// 1.1. Ресурс полного списка задач
 server.registerResource(
   "todo-list",
   "todo://list",
   {
-    description: "Текущий список всех задач (выполненных и активных)",
+    description:
+      "Task list. By default, all non-deleted tasks. " +
+      "Supports query ?status=active|completed|deleted.",
     mimeType: "text/plain",
   },
-  async (uri) => ({
-    contents: [
-      {
-        uri: uri.href,
-        mimeType: "text/plain",
-        text: formatTodoList(todoList),
-      },
-    ],
-  })
+  async (uri) => {
+    let status: FilterStatus = "all";
+    try {
+      const raw = new URL(uri.href).searchParams.get("status");
+      if (raw === "all" || raw === "active" || raw === "completed" || raw === "deleted") {
+        status = raw;
+      }
+    } catch {
+      // malformed URI — fall back to "all"
+    }
+    return {
+      contents: [
+        {
+          uri: uri.href,
+          mimeType: "text/plain",
+          text: formatTodoList(todoList, status),
+        },
+      ],
+    };
+  },
 );
 
-// 1.2. Ресурс текущей активной задачи
 server.registerResource(
   "current-todo",
   "todo://current",
   {
-    description: "Текущая самая приоритетная задача (находится на вершине списка)",
+    description:
+      "Current highest-priority active task (the first one that is neither completed nor deleted).",
     mimeType: "text/plain",
   },
   async (uri) => {
-    const current = todoList.find((t) => !t.completed);
+    const current = todoList.find(t => !t.completed && !t.deleted);
     return {
       contents: [
         {
           uri: uri.href,
           mimeType: "text/plain",
           text: current
-            ? `Текущая активная задача:\n[ ] ID: ${current.id} - ${current.text}`
-            : "Нет активных задач в списке.",
+            ? `Current active task:\n[ ] ID: ${current.id} - ${current.text}`
+            : "There are no active tasks in the list.",
         },
       ],
     };
-  }
+  },
 );
 
-// ==========================================
-// 2. READ-ИНСТРУМЕНТЫ (tool-зеркала ресурсов)
-//    Нужны, потому что не все MCP-клиенты
-//    отдают ресурсы модели как вызываемые действия.
-// ==========================================
+// ---------- Read tools (resource mirrors) ----------
 
-// Инструмент: Полный список задач
 server.registerTool(
   "list_todos",
   {
     description:
-      "Возвращает полный список задач: позиция, ID, статус ([ ]/[X]) и текст. " +
-      "Используйте, когда нужно перечислить задачи, посчитать их или найти ID по тексту.",
-    inputSchema: z.object({}),
+      "Returns the task list filtered by status: " +
+      "'all' (everything except deleted), 'active', 'completed', 'deleted'.",
+    inputSchema: z.object({
+      filterStatus: z
+        .enum(["all", "active", "completed", "deleted"])
+        .optional()
+        .default("all")
+        .describe("Filter: all | active | completed | deleted"),
+    }),
   },
-  async () => ({
-    content: [{ type: "text", text: formatTodoList(todoList) }],
-  })
+  async ({ filterStatus }) => ({
+    content: [{ type: "text", text: formatTodoList(todoList, filterStatus) }],
+  }),
 );
 
-// Инструмент: Количество задач
 server.registerTool(
   "count_todos",
   {
     description:
-      "Возвращает количество задач: всего, активных и выполненных. " +
-      "Используйте для вопросов «сколько задач в списке?».",
+      "Returns task counts: total (excluding deleted), active, completed, and deleted. " +
+      "Use this for questions like \"how many tasks are in the list?\".",
     inputSchema: z.object({}),
   },
   async () => {
-    const total = todoList.length;
-    const completed = todoList.filter((t) => t.completed).length;
-    const active = total - completed;
+    const visible = todoList.filter(t => !t.deleted);
+    const active = visible.filter(t => !t.completed).length;
+    const completed = visible.filter(t => t.completed).length;
+    const deleted = todoList.length - visible.length;
     return {
       content: [
         {
           type: "text",
-          text: `Всего задач: ${total}. Активных: ${active}. Выполненных: ${completed}.`,
+          text:
+            `Total (excluding deleted): ${visible.length}. ` +
+            `Active: ${active}. ` +
+            `Completed: ${completed}. ` +
+            `Deleted (hidden): ${deleted}.`,
         },
       ],
     };
-  }
+  },
 );
 
-// Инструмент: Текущая (топовая) активная задача
 server.registerTool(
   "get_current_todo",
   {
     description:
-      "Возвращает текущую самую приоритетную активную задачу — первую невыполненную в списке. " +
-      "Зеркало ресурса todo://current для клиентов, которые не показывают ресурсы.",
+      "Returns the current highest-priority active task — the first one that is neither completed nor deleted. " +
+      "Mirror of the todo://current resource.",
     inputSchema: z.object({}),
   },
   async () => {
-    const current = todoList.find((t) => !t.completed);
+    const current = todoList.find(t => !t.completed && !t.deleted);
     return {
       content: [
         {
           type: "text",
           text: current
-            ? `Текущая активная задача:\n[ ] ID: ${current.id} - ${current.text}`
-            : "Нет активных задач в списке.",
+            ? `Current active task:\n[ ] ID: ${current.id} - ${current.text}`
+            : "There are no active tasks in the list.",
         },
       ],
     };
-  }
+  },
 );
 
-// ==========================================
-// 3. ИНСТРУМЕНТЫ (Действия со списком)
-// ==========================================
+// ---------- Mutation tools ----------
 
-// Инструмент: Добавить задачу
 server.registerTool(
   "add_todo",
   {
-    description: "Добавляет новую задачу в конец списка.",
-    inputSchema: z.object({ text: z.string().min(1).describe("Текст задачи") }),
+    description: "Adds a new task to the end of the list.",
+    inputSchema: z.object({
+      text: z.string().min(1).describe("Task text"),
+    }),
   },
   async ({ text }) => {
     const newTodo: TodoItem = {
       id: Math.random().toString(36).substring(2, 11),
       text,
       completed: false,
+      deleted: false,
     };
     todoList.push(newTodo);
     return {
-      content: [{ type: "text", text: `Задача успешно добавлена. ID: ${newTodo.id}` }],
+      content: [
+        { type: "text", text: `Task added successfully. ID: ${newTodo.id}` },
+      ],
     };
-  }
+  },
 );
 
-// Инструмент: Отметить выполненной
 server.registerTool(
   "complete_todo",
   {
-    description: "Отмечает задачу как выполненную по её ID.",
-    inputSchema: z.object({ id: z.string().describe("Уникальный ID задачи") }),
+    description:
+      "Marks a task as completed by its ID. Deleted tasks are not modified.",
+    inputSchema: z.object({
+      id: z.string().describe("Unique task ID"),
+    }),
   },
   async ({ id }) => {
-    const todo = todoList.find((t) => t.id === id);
+    const todo = todoList.find(t => t.id === id);
     if (!todo) {
-      return { content: [{ type: "text", text: `Ошибка: Задача с ID ${id} не найдена.` }] };
+      return {
+        content: [{ type: "text", text: `Error: task with ID ${id} not found.` }],
+      };
+    }
+    if (todo.deleted) {
+      return {
+        content: [
+          { type: "text", text: `Error: task with ID ${id} is marked as deleted.` },
+        ],
+      };
     }
     todo.completed = true;
-    return {
-      content: [{ type: "text", text: `Задача "${todo.text}" (ID: ${id}) отмечена как выполненная.` }],
-    };
-  }
-);
-
-// Инструмент: Получить конкретную задачу по ID
-server.registerTool(
-  "get_todo_by_id",
-  {
-    description: "Возвращает детали конкретной задачи по её ID.",
-    inputSchema: z.object({ id: z.string().describe("Уникальный ID задачи") }),
-  },
-  async ({ id }) => {
-    const todo = todoList.find((t) => t.id === id);
-    if (!todo) {
-      return { content: [{ type: "text", text: `Задача с ID ${id} не найдена.` }] };
-    }
     return {
       content: [
         {
           type: "text",
-          text: `Задача найдена:\nID: ${todo.id}\nТекст: ${todo.text}\nСтатус: ${todo.completed ? "Выполнена" : "В процессе"}`,
+          text: `Task "${todo.text}" (ID: ${id}) marked as completed.`,
         },
       ],
     };
-  }
+  },
 );
 
-// Инструмент: Переместить в самый топ (On Top)
+server.registerTool(
+  "get_todo_by_id",
+  {
+    description:
+      "Returns details of a specific task by its ID (including deleted ones).",
+    inputSchema: z.object({
+      id: z.string().describe("Unique task ID"),
+    }),
+  },
+  async ({ id }) => {
+    const todo = todoList.find(t => t.id === id);
+    if (!todo) {
+      return {
+        content: [{ type: "text", text: `Task with ID ${id} not found.` }],
+      };
+    }
+    const status = todo.deleted
+      ? "Deleted"
+      : todo.completed
+        ? "Completed"
+        : "In progress";
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Task found:\nID: ${todo.id}\nText: ${todo.text}\nStatus: ${status}`,
+        },
+      ],
+    };
+  },
+);
+
 server.registerTool(
   "move_todo_to_top",
   {
-    description: "Перемещает существующую задачу в самый верх списка, делая её приоритетной.",
-    inputSchema: z.object({ id: z.string().describe("Уникальный ID задачи, которую нужно поднять в топ") }),
+    description:
+      "Moves a task to the very top of the list. Deleted tasks are not moved.",
+    inputSchema: z.object({
+      id: z.string().describe("Unique ID of the task to move to the top"),
+    }),
   },
   async ({ id }) => {
-    const index = todoList.findIndex((t) => t.id === id);
+    const index = todoList.findIndex(t => t.id === id);
     if (index === -1) {
-      return { content: [{ type: "text", text: `Ошибка: Задача с ID ${id} не найдена.` }] };
+      return {
+        content: [{ type: "text", text: `Error: task with ID ${id} not found.` }],
+      };
     }
-
+    if (todoList[index].deleted) {
+      return {
+        content: [
+          { type: "text", text: `Error: task with ID ${id} is marked as deleted.` },
+        ],
+      };
+    }
     const [todo] = todoList.splice(index, 1);
     todoList.unshift(todo);
-
     return {
-      content: [{ type: "text", text: `Задача "${todo.text}" успешно перемещена на вершину списка!` }],
+      content: [
+        {
+          type: "text",
+          text: `Task "${todo.text}" moved to the top of the list!`,
+        },
+      ],
     };
-  }
+  },
 );
 
-// ==========================================
-// 4. ЗАПУСК СЕРВЕРА
-// ==========================================
+server.registerTool(
+  "delete_todo",
+  {
+    description:
+      "Soft-deletes a task: sets deleted=true and hides it from the default list. " +
+      "The ID remains in memory; repeated calls are idempotent.",
+    inputSchema: z.object({
+      id: z.string().describe("Unique task ID"),
+    }),
+  },
+  async ({ id }) => {
+    const todo = todoList.find(t => t.id === id);
+    if (!todo) {
+      return {
+        content: [{ type: "text", text: `Error: task with ID ${id} not found.` }],
+      };
+    }
+    if (todo.deleted) {
+      return {
+        content: [
+          { type: "text", text: `Task with ID ${id} is already marked as deleted.` },
+        ],
+      };
+    }
+    todo.deleted = true;
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Task "${todo.text}" (ID: ${id}) marked as deleted and hidden from the active list.`,
+        },
+      ],
+    };
+  },
+);
+
+// ---------- Launch ----------
+
 serveStdio(() => server);
-console.error("MCP To-Do сервер успешно запущен!");
+console.error("MCP To-Do server started successfully!");
